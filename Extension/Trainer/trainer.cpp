@@ -1567,9 +1567,9 @@ std::string run(std::string_view verb, const std::vector<std::string> &a) {
     if (v == "open") {
         const auto tab = lower(arg(0));
         // The last three are the Tune tab on one of its lists.
-        const std::array<std::string_view, 7> tabs{"tune", "presets", "practice", "map", "realistic", "fun", "everything"};
+        const std::array<std::string_view, 8> tabs{"tune", "presets", "practice", "map", "realistic", "fun", "everything", "deckfx"};
         const auto found = std::ranges::find(tabs, tab);
-        if (!tab.empty() && found == tabs.end()) return "error: usage: trainer open [tune|presets|practice|map|realistic|fun|everything]";
+        if (!tab.empty() && found == tabs.end()) return "error: usage: trainer open [tune|deckfx|presets|practice|map|realistic|fun|everything]";
         s.open_tab = tab.empty() ? 1 : static_cast<int>(found - tabs.begin());
         ++s.open_serial;
         s.view_due = true;

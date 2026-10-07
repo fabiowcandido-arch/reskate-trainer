@@ -34,6 +34,11 @@ struct Page {
     bool hippy_editing{}, nocomply_editing{}, boneless_editing{}, offboard_editing{}, flip_editing{};
     std::uint64_t open_serial{}; // the last `trainer open` acted on
     bool show_page{};
+    // DECKFX tab: 0 Deck, 1 Wheels, 2 Trucks.
+    int deckfx_section{};
+    std::array<char, 64> deckfx_search{};
+    bool deckfx_only_changed{}, deckfx_points{}, deckfx_unused{};
+    std::size_t deckfx_hidden{};
 };
 void trick_heights(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trainer::View &view);
 Page &page() {
@@ -391,6 +396,82 @@ void trick_heights(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const
     end_card();
 }
 
+
+// DECKFX: the board's own values (deck, wheels, trucks) on one screen, found by group name in
+// the game's tuning table, so it follows whatever the installed game build calls them.
+bool deckfx_in_section(const std::string &group, int section) {
+    const auto g = lower(group);
+    const auto has = [&](const char *word) { return g.find(word) != std::string::npos; };
+    switch (section) {
+    case 0: return has("deck") || has("board");
+    case 1: return has("wheel");
+    default: return has("truck");
+    }
+}
+void deckfx_tab(SkateMenu &menu, const CallbacksV3 &callbacks, Page &p, const trainer::View &view) {
+    if (!view.ready) {
+        begin_card(menu, "deckfx-wait", "DECKFX");
+        note(view.status.c_str());
+        note("The values appear once a level is loaded.");
+        end_card();
+        return;
+    }
+    if (!view.editable) warn(view.blocked.c_str());
+    static constexpr const char *sections[]{"DECK", "WHEELS", "TRUCKS"};
+    const float width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2) / 3;
+    for (int i = 0; i < 3; ++i) {
+        if (i) ImGui::SameLine();
+        const bool on = p.deckfx_section == i;
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, skate_theme::blue);
+        if (ImGui::Button(sections[i], ImVec2(width, 0))) p.deckfx_section = i;
+        if (on) ImGui::PopStyleColor();
+    }
+    // Rows of this section after the filters.
+    const auto words = lower(p.deckfx_search.data());
+    std::vector<std::size_t> shown;
+    std::vector<const trainer::Row *> touched;
+    p.deckfx_hidden = 0;
+    for (std::size_t i = 0; i < view.rows.size(); ++i) {
+        const auto &row = view.rows[i];
+        if (!deckfx_in_section(row.group, p.deckfx_section)) continue;
+        if (row.touched) touched.push_back(&row);
+        if (row.detail && !p.deckfx_points && !row.touched) continue;
+        if (p.deckfx_only_changed && !row.touched && !row.frozen) continue;
+        if (!words.empty() && !contains_words(lower(row.id + " " + row.label + " " + row.friendly), words)) continue;
+        if (!row.used && !p.deckfx_unused && !row.touched && !row.frozen) {
+            ++p.deckfx_hidden;
+            continue;
+        }
+        shown.push_back(i);
+    }
+    const bool can_edit = view.editable && callbacks.queue_console_command != nullptr;
+    ImGui::SetNextItemWidth(std::max(px(120), ImGui::GetContentRegionAvail().x * 0.45f));
+    ImGui::InputTextWithHint("##deckfx-search", "Search this section", p.deckfx_search.data(), p.deckfx_search.size());
+    ImGui::SameLine();
+    ImGui::Checkbox("Only what I changed", &p.deckfx_only_changed);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!can_edit || touched.empty());
+    if (ImGui::Button("Reset this section"))
+        for (const auto *row : touched) trainer_command(menu, callbacks, "reset " + row->id);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Puts every changed value of %s back to the game's own.", sections[p.deckfx_section]);
+    ImGui::Checkbox("Graph points", &p.deckfx_points);
+    ImGui::SameLine();
+    ImGui::Checkbox("Values with no use found", &p.deckfx_unused);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Also list values the game was never found or seen reading.\nChanging those will probably do nothing.");
+    ImGui::SameLine();
+    if (p.deckfx_hidden) ImGui::TextDisabled("%zu shown, %zu changed, %zu hidden", shown.size(), touched.size(), p.deckfx_hidden);
+    else ImGui::TextDisabled("%zu shown, %zu changed", shown.size(), touched.size());
+    note("Truck positions, masses and collision sizes are read when the skater is built: respawn to feel them. The box on the left locks a value against presets and Reset.");
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(shown.size()));
+    while (clipper.Step())
+        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i)
+            value_row(menu, callbacks, p, view, view.rows[shown[static_cast<std::size_t>(i)]], false, false);
+    if (shown.empty()) note("Nothing matches. If this section is empty, run `trainer dump` in the console and check the value names.");
+}
+
 void practice_tab(SkateMenu &menu, const Model &model, const CallbacksV3 &callbacks, Page &p, const trainer::View &view) {
     const auto telemetry = trainer::telemetry();
     begin_card(menu, "speed", "GAME SPEED", "Slow motion for learning a line");
@@ -555,8 +636,14 @@ bool trainer_take_open() {
     if (view->open_serial == p.open_serial) return false;
     p.open_serial = view->open_serial;
     // `trainer open` still takes "presets": they live on the Tune tab now.
-    p.tab = view->open_tab >= 4 ? 0 : std::clamp(view->open_tab - 1, 0, 2);
-    if (view->open_tab >= 4) p.mode = std::clamp(view->open_tab - 4, 0, 2);
+    // Tabs: 0 TUNE, 1 DECKFX, 2 PRACTICE, 3 MAP & HUD. open_tab 7 is `trainer open deckfx`.
+    if (view->open_tab == 7) p.tab = 1;
+    else if (view->open_tab >= 4) p.tab = 0;
+    else {
+        const int old = std::clamp(view->open_tab - 1, 0, 2); // 0 tune, 1 practice, 2 map
+        p.tab = old == 0 ? 0 : old + 1;
+    }
+    if (view->open_tab >= 4 && view->open_tab <= 6) p.mode = std::clamp(view->open_tab - 4, 0, 2);
     p.show_page = true;
     return true;
 }
@@ -578,12 +665,13 @@ void trainer_page(SkateMenu &menu, const Model &model, const CallbacksV3 &callba
     ImGui::SameLine();
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("The game as it shipped: every value, lock, preset and trick slider.");
-    category_tabs(menu, p.tab, {"TUNE", "PRACTICE", "MAP & HUD"}, "trainer-tabs");
+    category_tabs(menu, p.tab, {"TUNE", "DECKFX", "PRACTICE", "MAP & HUD"}, "trainer-tabs");
     ImGui::PushID(p.tab);
     ImGui::BeginChild("trainer-tab", ImVec2(0, page_body_height(menu)));
     switch (p.tab) {
     case 0: tune_tab(menu, model, callbacks, p, *view); break;
-    case 1: practice_tab(menu, model, callbacks, p, *view); break;
+    case 1: deckfx_tab(menu, callbacks, p, *view); break;
+    case 2: practice_tab(menu, model, callbacks, p, *view); break;
     default: map_tab(menu, callbacks, *view); break;
     }
     ImGui::EndChild();
